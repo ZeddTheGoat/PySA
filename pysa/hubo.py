@@ -184,8 +184,8 @@ class HUBOSolver:
                     for r in range(num_replicas - 1):
                         d_beta = betas[r+1] - betas[r]
                         d_energy = energies[r+1] - energies[r]
-                        swap_prob = np.exp(d_beta * d_energy)
-                        if swap_prob >= 1 or rng.random() < swap_prob:
+                        delta = d_beta * d_energy
+                        if delta >= 0 or rng.random() < np.exp(delta):
                             # Swap states and energies
                             states[[r, r+1]] = states[[r+1, r]]
                             energies[[r, r+1]] = energies[[r+1, r]]
