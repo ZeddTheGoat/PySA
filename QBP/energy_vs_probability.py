@@ -92,11 +92,13 @@ def sa_sample_energies(
     return np.asarray(df['best_energy'], dtype=float)
 
 
-def probability_of_match_to_reference(energies, ref_energy, eps=1e-8):
+def probability_leq_reference(energies, ref_energy, tol=1e-8):
+    """Probability that energy is <= reference + tol (allows better-than-BP solutions)."""
     energies = np.asarray(energies, dtype=float)
     if energies.size == 0:
         return 0.0, 0
-    hits = int(np.sum(np.abs(energies - float(ref_energy)) <= eps))
+    thresh = float(ref_energy) + float(tol)
+    hits = int(np.sum(energies <= thresh))
     prob = float(hits / energies.size)
     return prob, hits
 
@@ -105,7 +107,7 @@ def main():
     # Parameters
     N = 420
     d_v, d_c = 2, 3
-    snr_db = 1
+    snr_list = [1, 2, 3, 4, 5]
     lambda_penalty = 2
     modulation_type = 'BPSK'
     num_reads = 2000
@@ -119,69 +121,88 @@ def main():
     os.makedirs(qbp_plots, exist_ok=True)
     H, G, k, n = generate_ldpc_code(N, d_v, d_c, seed=42)
 
-    # Fix the decoding instance once (keeps sweep comparable)
-    llr = compute_llr_once(H, G, k, modulation_type, snr_db, seed=fixed_instance_seed)
+    # 2) Grid over (min_temp, max_temp) at fixed num_sweeps for SNRs 1..5
+    # Temperature grids
+    min_grid = np.linspace(0.01, 0.50, 11)
+    max_grid = np.linspace(0.10, 5.00, 11)
+    energy_tol = 1e-8
 
-    # Build solver once and get BP reference energy under Spin-HUBO
-    solver = build_spin_hubo_solver(H, llr, lambda_penalty)
-    bp_energy = compute_bp_reference_energy(H, llr, solver, max_iters=500, damping=0.0)
+    for snr_db in snr_list:
+        # Fix the decoding instance once per SNR (reproducible across runs)
+        llr = compute_llr_once(H, G, k, modulation_type, snr_db, seed=fixed_instance_seed)
 
-    # 1) Single-run summary vs BP reference
-    energies = sa_sample_energies(
-        solver,
-        num_reads=num_reads,
-        num_sweeps=num_sweeps,
-        min_temp=min_temp,
-        max_temp=max_temp,
-        parallel_reads=parallel_reads,
-        use_pt=True,
-        num_replicas=2,
-    )
-    p_bp, hits = probability_of_match_to_reference(energies, bp_energy)
-    print(f"SA(PT-2) vs BP: hits={hits}/{energies.size} | P(E ≈ E_BP) = {p_bp:.4f} | E_BP = {bp_energy:.6f}")
+        # Build solver and BP reference energy
+        solver = build_spin_hubo_solver(H, llr, lambda_penalty)
+        bp_energy = compute_bp_reference_energy(H, llr, solver, max_iters=500, damping=0.0)
 
-    # 2) Grid over (min_temp, max_temp) at fixed num_sweeps
-    # Narrower temperature window per your note
-    min_grid = [0.02, 0.03, 0.05, 0.07, 0.10]
-    max_grid = [0.05, 0.07, 0.10, 0.12, 0.15]
-    prob_mat = np.zeros((len(min_grid), len(max_grid)), dtype=float)
+        # Quick single-run summary with default temps
+        energies = sa_sample_energies(
+            solver,
+            num_reads=num_reads,
+            num_sweeps=num_sweeps,
+            min_temp=min_temp,
+            max_temp=max_temp,
+            parallel_reads=parallel_reads,
+            use_pt=True,
+            num_replicas=2,
+        )
+        p_bp, hits = probability_leq_reference(energies, bp_energy, tol=energy_tol)
+        print(f"SNR={snr_db} | SA(PT-2) vs BP: hits={hits}/{energies.size} | P(E <= E_BP+tol) = {p_bp:.4f} | E_BP = {bp_energy:.6f} | tol={energy_tol}")
 
-    for i, tmin in enumerate(min_grid):
-        for j, tmax in enumerate(max_grid):
-            if tmax <= tmin:
-                prob_mat[i, j] = np.nan
-                continue
-            en = sa_sample_energies(
-                solver,
-                num_reads=num_reads,
-                num_sweeps=num_sweeps,
-                min_temp=float(tmin),
-                max_temp=float(tmax),
-                parallel_reads=parallel_reads,
-                use_pt=True,
-                num_replicas=2,
-            )
-            p, _ = probability_of_match_to_reference(en, bp_energy)
-            prob_mat[i, j] = p
+        prob_mat = np.zeros((len(min_grid), len(max_grid)), dtype=float)
+        for i, tmin in enumerate(min_grid):
+            for j, tmax in enumerate(max_grid):
+                if tmax <= tmin:
+                    prob_mat[i, j] = np.nan
+                    continue
+                en = sa_sample_energies(
+                    solver,
+                    num_reads=num_reads,
+                    num_sweeps=num_sweeps,
+                    min_temp=float(tmin),
+                    max_temp=float(tmax),
+                    parallel_reads=parallel_reads,
+                    use_pt=True,
+                    num_replicas=2,
+                )
+                p, _ = probability_leq_reference(en, bp_energy, tol=energy_tol)
+                prob_mat[i, j] = p
 
-    # 3D surface plot of probability vs (min_temp, max_temp)
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    X, Y = np.meshgrid(max_grid, min_grid)
-    Z = np.ma.masked_invalid(prob_mat)
-    surf = ax.plot_surface(X, Y, Z, cmap='viridis', vmin=0.0, vmax=1.0,
-                           edgecolor='k', linewidth=0.3, antialiased=True, alpha=0.9)
-    fig.colorbar(surf, ax=ax, shrink=0.7, pad=0.1, label='P(E ≈ E_BP)')
-    ax.set_xlabel('max_temp (start T)')
-    ax.set_ylabel('min_temp (end T)')
-    ax.set_zlabel('P(E ≈ E_BP)')
-    ax.set_zlim(0.0, 1.0)
-    ax.set_title(f'P(match BP) 3D surface @ {snr_db} dB, sweeps={num_sweeps}')
-    fig.tight_layout()
-    out_curve = os.path.join(qbp_plots, f"prob_best_vs_minmax_snr{snr_db}.png")
-    fig.savefig(out_curve, dpi=300)
-    print(f"Saved 3D grid plot to {out_curve}")
+        # Find best (min_temp, max_temp) pair by probability (ignore NaNs)
+        if np.all(np.isnan(prob_mat)):
+            best_info = None
+            print(f"SNR={snr_db} | Warning: all (min,max) pairs invalid; no best temperature found.")
+        else:
+            best_flat = int(np.nanargmax(prob_mat))
+            bi, bj = np.unravel_index(best_flat, prob_mat.shape)
+            best_min = float(min_grid[bi])
+            best_max = float(max_grid[bj])
+            best_prob = float(prob_mat[bi, bj])
+            best_info = (best_min, best_max, best_prob)
+            print(f"SNR={snr_db} | Best temps: min={best_min}, max={best_max} with P(E<=E_BP+tol)={best_prob:.4f}")
+
+        # 3D surface plot of probability vs (min_temp, max_temp)
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        X, Y = np.meshgrid(max_grid, min_grid)
+        Z = np.ma.masked_invalid(prob_mat)
+        surf = ax.plot_surface(X, Y, Z, cmap='viridis', vmin=0.0, vmax=1.0,
+                               edgecolor='k', linewidth=0.3, antialiased=True, alpha=0.9)
+        # Highlight the best point if available
+        if best_info is not None:
+            ax.scatter([best_max], [best_min], [best_prob], color='red', s=40, label='best')
+            ax.legend(loc='upper left')
+        fig.colorbar(surf, ax=ax, shrink=0.7, pad=0.1, label='P(E <= E_BP + tol)')
+        ax.set_xlabel('max_temp (start T)')
+        ax.set_ylabel('min_temp (end T)')
+        ax.set_zlabel('P(E <= E_BP + tol)')
+        ax.set_zlim(0.0, 1.0)
+        ax.set_title(f'P(E <= E_BP+tol) 3D surface @ {snr_db} dB, sweeps={num_sweeps}')
+        fig.tight_layout()
+        out_curve = os.path.join(qbp_plots, f"prob_best_vs_minmax_snr{snr_db}.png")
+        fig.savefig(out_curve, dpi=300)
+        print(f"Saved 3D grid plot to {out_curve}")
 
 
 if __name__ == "__main__":
